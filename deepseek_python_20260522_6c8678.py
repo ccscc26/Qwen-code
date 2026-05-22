@@ -5,11 +5,9 @@ import json
 import time
 import logging
 import threading
-import gc
-import datetime
-import multiprocessing as mp
 from typing import Dict, List, Set, Optional, Tuple
 from collections import defaultdict
+from pathlib import Path
 
 # ==========================================
 # 1. 环境预检与依赖管理
@@ -34,8 +32,12 @@ def check_dependencies():
             messagebox.showerror("环境错误", f"缺少核心模块：{', '.join(missing)}\n"
                                 f"请执行：pip install {' '.join(missing)} openpyxl xlsxwriter")
             root.destroy()
-        except Exception:
+        except tk.TclError:
+            # 无 GUI 环境，使用命令行提示
             print(f"[ERROR] 缺少核心模块：{', '.join(missing)}")
+            print(f"请执行：pip install {' '.join(missing)} openpyxl xlsxwriter")
+        except Exception as e:
+            print(f"[ERROR] 缺少核心模块：{', '.join(missing)} (初始化错误：{e})")
         sys.exit(1)
 
 check_dependencies()
@@ -51,7 +53,7 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s', encoding='utf-8')
 logger = logging.getLogger(__name__)
 
 # ==========================================
@@ -86,9 +88,43 @@ REGEX_PATTERNS = {
 }
 
 # ==========================================
-# 3. 编码检测与文件读取
+# 3. 编码检测与文件读取 (安全增强版)
 # ==========================================
+def _is_safe_path(filepath: str, allowed_base: Optional[str] = None) -> bool:
+    """检查文件路径是否安全，防止目录遍历攻击"""
+    try:
+        # 解析绝对路径
+        resolved = Path(filepath).resolve()
+        
+        # 检查是否包含目录遍历模式
+        if '..' in filepath:
+            logger.warning(f"检测到目录遍历尝试：{filepath}")
+            return False
+        
+        # 如果指定了允许的基础目录，检查是否在该目录下
+        if allowed_base:
+            base_path = Path(allowed_base).resolve()
+            if not str(resolved).startswith(str(base_path)):
+                logger.warning(f"文件路径超出允许范围：{filepath}")
+                return False
+        
+        # 检查是否为有效文件
+        if not resolved.is_file():
+            logger.warning(f"文件不存在或不是普通文件：{filepath}")
+            return False
+            
+        return True
+    except Exception as e:
+        logger.error(f"路径验证失败：{e}")
+        return False
+
 def _detect_encoding(filepath: str) -> str:
+    """检测文件编码，增加路径安全检查"""
+    # 安全校验
+    if not _is_safe_path(filepath):
+        logger.error(f"不安全的文件路径被拒绝：{filepath}")
+        return 'utf-8'
+    
     try:
         with open(filepath, 'rb') as f:
             raw = f.read(8192)
@@ -99,17 +135,32 @@ def _detect_encoding(filepath: str) -> str:
                     return enc
             except UnicodeDecodeError:
                 continue
-    except Exception:
-        pass
+    except FileNotFoundError:
+        logger.error(f"文件不存在：{filepath}")
+    except PermissionError:
+        logger.error(f"无权限读取文件：{filepath}")
+    except Exception as e:
+        logger.error(f"编码检测异常：{e}")
     return 'utf-8'
 
 def read_file_auto_encoding(filename: str) -> str:
+    """读取文件并自动检测编码，增加路径安全检查"""
+    # 安全校验
+    if not _is_safe_path(filename):
+        logger.error(f"不安全的文件路径被拒绝：{filename}")
+        return ""
+    
     enc = _detect_encoding(filename)
     try:
         with open(filename, 'r', encoding=enc, errors='replace') as f:
             return f.read()
-    except Exception:
-        return ""
+    except FileNotFoundError:
+        logger.error(f"文件不存在：{filename}")
+    except PermissionError:
+        logger.error(f"无权限读取文件：{filename}")
+    except Exception as e:
+        logger.error(f"文件读取异常：{e}")
+    return ""
 
 # ==========================================
 # 4. MML解析引擎
@@ -527,12 +578,20 @@ class MMLToolGUI:
         self.root.geometry("1350x850")
 
         self.style = ttk.Style()
-        self.style.configure('.', font=('Microsoft YaHei UI', 10))
-        self.style.configure('Treeview', font=('Microsoft YaHei UI', 10), rowheight=26)
-        self.style.configure('Treeview.Heading', font=('Microsoft YaHei UI', 10, 'bold'))
-        self.style.configure('Action.TButton', font=('Microsoft YaHei UI', 10, 'bold'))
-        self.style.configure('NewAction.TButton', font=('Microsoft YaHei UI', 10, 'bold'), foreground='blue')
-        self.style.configure('MatchAction.TButton', font=('Microsoft YaHei UI', 10, 'bold'), foreground='purple')
+        # 使用跨平台的中文字体配置，修复乱码问题
+        if sys.platform == 'win32':
+            font_family = 'Microsoft YaHei UI'
+        elif sys.platform == 'darwin':
+            font_family = 'PingFang SC'
+        else:  # Linux
+            font_family = 'WenQuanYi Micro Hei'
+        
+        self.style.configure('.', font=(font_family, 10))
+        self.style.configure('Treeview', font=(font_family, 10), rowheight=26)
+        self.style.configure('Treeview.Heading', font=(font_family, 10, 'bold'))
+        self.style.configure('Action.TButton', font=(font_family, 10, 'bold'))
+        self.style.configure('NewAction.TButton', font=(font_family, 10, 'bold'), foreground='blue')
+        self.style.configure('MatchAction.TButton', font=(font_family, 10, 'bold'), foreground='purple')
 
         self.files_data = []
         self.selected_fields = {}
@@ -709,7 +768,7 @@ class MMLToolGUI:
                 self.status.config(text="数据源已全部清空。")
 
     def show_fields_tree(self, idx):
-        """渲染属性过滤树"""
+        """渲染属性过滤树（修复中文乱码）"""
         old_states = {}
         for child_id in self.param_tree.get_children():
             old_states[child_id] = self.param_tree.item(child_id, "open")
@@ -757,7 +816,7 @@ class MMLToolGUI:
                 child_iid = f"{cmd}|||{f}"
 
                 self.param_tree.insert(parent_node, "end", iid=child_iid,
-                                      text=f"{prefix}{f}")
+                                      text=f"{prefix}{str(f)}")
 
                 if any(kw in f for kw in ["参数组标识", "组标识", "切换参数组"]):
                     unique_vals = sorted(set(
@@ -771,7 +830,7 @@ class MMLToolGUI:
                         v_prefix = "[v] " if is_val_checked else "[ ] "
                         val_iid = f"{cmd}|||{f}|||{val}"
                         self.param_tree.insert(parent_node, "end", iid=val_iid,
-                                              text=f"    {v_prefix}{val}")
+                                              text=f"    {v_prefix}{str(val)}")
 
     def _on_tree_double_click(self, event):
         """双击切换勾选状态"""
@@ -914,6 +973,7 @@ class MMLToolGUI:
             messagebox.showinfo("成功", "字段过滤配置文件导出完毕！")
 
     def load_config(self):
+        """加载配置文件，增加JSON内容验证"""
         sel = self.file_lb.curselection()
         if not sel:
             return
@@ -925,13 +985,33 @@ class MMLToolGUI:
         if not path:
             return
 
+        # 安全校验路径
+        if not _is_safe_path(path):
+            messagebox.showerror("安全警告", f"不安全的配置文件路径被拒绝：{path}")
+            return
+
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 cfg = json.load(f)
 
-            if isinstance(cfg, dict) and "columns" in cfg:
+            # JSON 结构验证
+            if not isinstance(cfg, dict):
+                raise ValueError("配置文件必须是 JSON 对象")
+            
+            if "columns" in cfg:
                 cfg_cols = cfg["columns"]
                 cfg_groups = cfg.get("group_filters", {})
+                
+                # 验证 columns 结构
+                if not isinstance(cfg_cols, dict):
+                    raise ValueError("'columns' 必须是字典类型")
+                for cmd, fields in cfg_cols.items():
+                    if not isinstance(fields, list):
+                        raise ValueError(f"命令 '{cmd}' 的字段列表必须是数组类型")
+                        
+                # 验证 group_filters 结构
+                if not isinstance(cfg_groups, dict):
+                    raise ValueError("'group_filters' 必须是字典类型")
             else:
                 cfg_cols = cfg
                 cfg_groups = {}
@@ -954,13 +1034,22 @@ class MMLToolGUI:
             self.show_fields_tree(idx)
             messagebox.showinfo("配置导入成功", "成功匹配并导入配置文件属性与过滤项！")
 
+        except json.JSONDecodeError as e:
+            messagebox.showerror("加载失败", f"JSON 格式错误:\n{str(e)}")
+        except ValueError as e:
+            messagebox.showerror("加载失败", f"配置验证失败:\n{str(e)}")
+        except FileNotFoundError:
+            messagebox.showerror("加载失败", f"配置文件不存在:\n{path}")
+        except PermissionError:
+            messagebox.showerror("加载失败", f"无权限读取配置文件:\n{path}")
         except Exception as e:
+            logger.error(f"加载配置异常：{e}")
             messagebox.showerror("加载失败", f"解析配置文件失败:\n{str(e)}")
 
-    def export_all_merged(self):
-        if not self.files_data:
-            messagebox.showwarning("提示", "请先加载MML文件")
-            return
+        def export_all_merged(self):
+            if not self.files_data:
+                messagebox.showwarning("提示", "请先加载MML文件")
+                return
 
         path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
         if not path:
@@ -1153,7 +1242,6 @@ class MMLToolGUI:
 # 8. 主入口
 # ==========================================
 if __name__ == "__main__":
-    mp.freeze_support()
 
     root = tk.Tk()
     app = MMLToolGUI(root)
